@@ -12,7 +12,6 @@ import json
 import uuid
 import base64
 import random
-import tempfile
 import urllib.request
 import urllib.parse
 from collections import Counter
@@ -21,7 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from PIL import Image, ImageEnhance
+from PIL import Image
 from flask import Flask, request, session, redirect, url_for, render_template, jsonify, flash
 
 app = Flask(__name__)
@@ -93,122 +92,89 @@ def clean_ocr_text(text):
 
 
 # ---------------------------------------------------------------------------
-# Cloud OCR Pipeline (OCR.space free API)
+# Image-to-text via Gemini's multimodal (vision) API
 # ---------------------------------------------------------------------------
-# Running Tesseract locally needs its own process memory on top of Flask +
-# matplotlib + Pillow — on a 512MB free-tier host that combination can
-# exceed the limit and get the whole worker OOM-killed. Sending the image to
-# a free cloud OCR API instead means this process never has to run an OCR
-# engine itself, so it stays light no matter the host's RAM budget.
-#
-# Get a free key (no credit card) at https://ocr.space/ocrapi/freekey and set
-# it as the OCR_SPACE_API_KEY environment variable. Without one, the shared
-# demo key "helloworld" is used — it works, but is rate-limited and shared
-# across everyone who hasn't set their own key, so expect occasional failures.
-OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY", "helloworld")
-OCR_SPACE_URL = "https://api.ocr.space/parse/image"
-
-
-def call_ocrspace_ocr(image_path, api_key):
-    """Sends the image to the OCR.space cloud API and returns cleaned lines of text."""
+# Rather than running a separate OCR engine or calling a separate OCR
+# service, the photo is sent straight to Gemini — the same model that
+# writes the quiz below. Gemini reads the image and returns clean text
+# describing the notes in one step. This keeps the app to a single external
+# dependency (Gemini) instead of stacking OCR + LLM + memory-heavy local
+# processing on top of each other.
+def resize_image_for_upload(image_bytes, max_dim=1600):
+    """Shrinks a photo before sending it to Gemini, to keep upload/token cost low."""
     try:
-        boundary = uuid.uuid4().hex
-        with open(image_path, "rb") as f:
-            file_bytes = f.read()
-
-        fields = {"apikey": api_key, "language": "eng", "OCREngine": "2", "scale": "true"}
-        parts = []
-        for name, value in fields.items():
-            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
-        parts.append(
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"image.png\"\r\n"
-            f"Content-Type: image/png\r\n\r\n"
-        )
-        body = "".join(parts).encode("utf-8") + file_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
-
-        req = urllib.request.Request(
-            OCR_SPACE_URL,
-            data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-
-        if result.get("IsErroredOnProcessing"):
-            print(f"OCR.space error: {result.get('ErrorMessage')}")
-            return []
-
-        parsed = result.get("ParsedResults") or []
-        if not parsed:
-            return []
-
-        raw_text = parsed[0].get("ParsedText", "")
-        raw_lines = raw_text.strip().splitlines()
-        return [clean_ocr_text(l.strip()) for l in raw_lines if len(l.strip()) > 0]
-    except Exception as e:
-        print(f"OCR.space request failed: {e}")
-        return []
-
-
-def preprocess_image_for_ocr(input_path, output_path):
-    """Shrinks and lightly enhances the image before sending it to OCR.space.
-
-    Downscaling keeps the upload small and fast (the free OCR.space tier caps
-    uploads at 1MB) and grayscale is enough for OCR while cutting file size.
-    """
-    try:
-        with Image.open(input_path) as img:
+        with Image.open(io.BytesIO(image_bytes)) as img:
             if img.mode != "RGB":
                 img = img.convert("RGB")
-
-            max_dim = 1600
             if max(img.size) > max_dim:
                 img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.4)
-            sharp_enhancer = ImageEnhance.Sharpness(img)
-            img = sharp_enhancer.enhance(1.3)
-
-            img = img.convert("L")
-            img.save(output_path, "PNG", optimize=True)
-            return True
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=85, optimize=True)
+            return buf.getvalue()
     except Exception as e:
-        print(f"Image preprocessing warning: {e}")
-        return False
+        print(f"Image resize warning: {e}")
+        return image_bytes
 
 
-def extract_text_from_image(file_storage):
-    """Extracts text strictly from the provided image without fallback placeholders."""
+def extract_text_via_gemini_vision(image_bytes, api_key):
+    """Sends a photo of notes to Gemini and returns the notes as plain text."""
+    if not api_key or not image_bytes:
+        return ""
+
+    resized = resize_image_for_upload(image_bytes)
+    b64_image = base64.b64encode(resized).decode("utf-8")
+
+    prompt = (
+        "This image shows a student's study notes (handwritten or printed). "
+        "Transcribe the readable educational content as plain text — the "
+        "definitions, facts, and explanations in the notes. Ignore page "
+        "numbers, doodles, or illegible scribbles. Return ONLY the "
+        "transcribed text, no commentary, no markdown."
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}},
+                {"text": prompt},
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1},
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        print(f"Gemini vision OCR request failed: {e}")
+        return ""
+
+
+def extract_text_from_image(file_storage, api_key):
+    """Extracts text strictly from the provided image using Gemini vision."""
     image_bytes = file_storage.read()
     if not image_bytes:
         return ""
 
-    lines = []
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as raw_temp:
-        raw_temp.write(image_bytes)
-        raw_temp_path = raw_temp.name
-
-    enhanced_temp_path = raw_temp_path + "_enhanced.png"
-    preprocess_image_for_ocr(raw_temp_path, enhanced_temp_path)
-    target_path = enhanced_temp_path if os.path.exists(enhanced_temp_path) else raw_temp_path
-
-    try:
-        lines = call_ocrspace_ocr(target_path, OCR_SPACE_API_KEY)
-    finally:
-        for p in [raw_temp_path, enhanced_temp_path]:
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-
-    if not lines:
+    if not api_key:
+        # No Gemini key means no OCR path is available — the caller falls
+        # back to prompting the person to paste their notes as text instead.
         return ""
 
+    raw_text = extract_text_via_gemini_vision(image_bytes, api_key)
+    if not raw_text:
+        return ""
+
+    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
     structured_sentences = []
     for line in lines:
-        line = line.strip()
         if len(line) < 3:
             continue
         if not line.endswith((".", "!", "?", ":", ";")):
@@ -549,11 +515,19 @@ def generate_quiz(topics, questions_per_topic=4):
                 f"You are an expert exam educator creating high-level diagnostic questions for students.\n"
                 f"Topic: {topic_name}\n"
                 f"Study Notes Content:\n\"\"\"\n{topic_text[:2000]}\n\"\"\"\n\n"
-                f"Write exactly {questions_per_topic} rigorous, high-quality multiple choice questions testing understanding of this content.\n"
-                f"Each question must have:\n"
-                f"- A clear, well-phrased question stem.\n"
-                f"- Exactly 1 strictly accurate correct answer based on the notes.\n"
-                f"- Exactly 3 plausible, realistic, educational distractors.\n"
+                f"Write exactly {questions_per_topic} rigorous, high-quality multiple choice questions "
+                f"testing understanding of this content.\n\n"
+                f"Quality rules (follow strictly):\n"
+                f"1. Ground every question and its correct answer strictly in the notes above — "
+                f"do not invent facts the notes don't support.\n"
+                f"2. Every option (correct answer + all 3 distractors) must directly answer the same "
+                f"question stem in the same style — e.g. if the question asks for a definition, all "
+                f"4 options must be plausible definitions, not unrelated facts.\n"
+                f"3. All 4 options for a question should be similar in length (within ~15% word count "
+                f"of each other) so the correct answer isn't guessable by looking longer or more detailed.\n"
+                f"4. No option may repeat, word-for-word, across different questions in this set.\n"
+                f"5. Distractors should reflect realistic misconceptions about {topic_name}, not random "
+                f"or absurd statements.\n\n"
                 f"Return ONLY a valid JSON array in this format:\n"
                 '[{"question": "...", "answer": "...", "distractors": ["...", "...", "..."]}]'
             )
@@ -761,7 +735,13 @@ def upload():
         if custom_text and len(custom_text.strip()) >= 15:
             extracted_text = clean_ocr_text(custom_text.strip())
         else:
-            extracted_text = clean_ocr_text(extract_text_from_image(f))
+            active_key = store.get("api_key") or os.environ.get("GEMINI_API_KEY", "")
+            if not active_key:
+                return render_template(
+                    "index.html",
+                    error="Reading notes from a photo requires a Gemini API key. Add one above, or paste your notes as text instead."
+                )
+            extracted_text = clean_ocr_text(extract_text_from_image(f, active_key))
 
         if not extracted_text or len(extracted_text.strip()) < 10:
             return render_template(

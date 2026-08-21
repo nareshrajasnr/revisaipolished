@@ -45,7 +45,7 @@
     <div class="card-note rounded-sm p-5">
       <p class="tag-eyebrow mb-2">Optional</p>
       <label class="block text-sm font-semibold mb-1" style="color:var(--ink-2);">Gemini API key</label>
-      <p class="text-xs text-gray-600 mb-2">Leave blank to use the built-in offline question engine. Add a key for richer, AI-written questions.</p>
+      <p class="text-xs text-gray-600 mb-2">Required if you're uploading photos of notes (Gemini reads them). Leave blank if you're only pasting text — quizzes will use the built-in offline engine.</p>
       <input type="password" name="gemini_api_key" placeholder="AIza…" value="{{ api_key or '' }}"
              class="w-full border border-gray-300 rounded-sm px-3 py-2 text-sm font-mono-lbl focus:outline-none focus:ring-2" style="--tw-ring-color:var(--amber);">
     </div>
